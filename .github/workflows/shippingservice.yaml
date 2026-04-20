@@ -21,6 +21,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write   # required to request GitHub OIDC token for cluster authentication
 
 
 jobs:
@@ -90,11 +91,11 @@ jobs:
       HELM_CHARTS_TOKEN: ${{ secrets.HELM_CHARTS_TOKEN }}
 
 
-  # update helm values for prod (requires manual approval via GitHub Environment)
-  # GitHub does NOT allow environment: + uses: in the same job.
-  # So we use a two-step pattern:
-  #   1. prod-approval-gate  — a regular job with environment: production (this is what triggers the pause)
-  #   2. update-helm-values-prod — runs after the gate is approved
+  # ── Production CD Gate ───────────────────────────────────────────────────────
+  # Two-step pattern required because GitHub does NOT allow environment: + uses:
+  # in the same job.
+  #   1. prod-approval-gate  — pauses the workflow for manual approval
+  #   2. deploy-to-prod      — self-hosted runner deploys directly to the cluster
   prod-approval-gate:
     needs: [push, generate-tag-and-build-image]
     if: |
@@ -105,25 +106,126 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - name: Approved — proceeding to update Helm chart for Production
+      - name: Approved — proceeding to deploy shippingservice to Production
         run: echo "Production deployment approved for tag ${{ needs.generate-tag-and-build-image.outputs.tag }}"
 
-  update-helm-values-prod:
+
+  # ── GitHub Native CD — deploy directly to prod cluster via OIDC ──────────────
+  # No ArgoCD involved. No static kubeconfig. No long-lived token.
+  #
+  # Auth flow:
+  #   1. Runner requests a short-lived JWT from GitHub's OIDC provider
+  #        sub = repo:HipsterShopp/hipstershop-shippingservice:ref:refs/heads/main
+  #   2. kube-apiserver validates the JWT and resolves username as:
+  #        github:repo:HipsterShopp/hipstershop-shippingservice:ref:refs/heads/main
+  #   3. RoleBinding in hipster-backend grants this identity deploy permissions
+  #
+  # Runner is inside the same VPC — reaches API server via 127.0.0.1:6443.
+  # CA cert is read directly from the node filesystem — zero secrets needed.
+  #
+  # Prerequisites (one-time):
+  #   kubectl apply -f hipstershop-infra/rbac/github-actions-oidc-shippingservice.yaml
+  deploy-to-prod:
+    name: Deploy shippingservice to prod cluster
     needs: [prod-approval-gate, generate-tag-and-build-image]
     if: |
       always() &&
       needs.prod-approval-gate.result == 'success'
-    uses: HipsterShopp/hipstershop-shared-workflows/.github/workflows/helm-updater-job.yaml@feature/loose-coupling
-    with:
-      service_name: shippingservice
-      image_tag: ${{ needs.generate-tag-and-build-image.outputs.tag }}
-      helm_values_path: "hipstershop-micro-apps/shippingservice/values.prod.yaml"
-      target_branch: "main"
-    secrets:
-      HELM_CHARTS_TOKEN: ${{ secrets.HELM_CHARTS_TOKEN }}
+    runs-on: self-hosted
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Request GitHub OIDC token
+        id: oidc
+        run: |
+          # GitHub injects ACTIONS_ID_TOKEN_REQUEST_TOKEN and ACTIONS_ID_TOKEN_REQUEST_URL
+          # into every runner — including self-hosted — when id-token: write is set.
+          # audience=kubernetes must match --oidc-client-id configured on the kube-apiserver.
+          TOKEN=$(curl -sSf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=kubernetes" \
+            | jq -r '.value')
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Configure kubectl (OIDC kubeconfig)
+        run: |
+          echo "${{ secrets.K8S_CA_CERT }}" | base64 -d > ca.crt
+          # Read CA cert directly from the runner node — no secret needed.
+          # API server reachable at localhost because runner is in the same VPC.
+          kubectl config set-cluster prod-cluster \
+            --server=${{ secrets.K8S_API_SERVER }} \
+            --certificate-authority=ca.crt \
+            --embed-certs=true
+
+          kubectl config set-credentials github-actions-oidc \
+            --token="${{ steps.oidc.outputs.token }}"
+
+          kubectl config set-context prod \
+            --cluster=prod-cluster \
+            --user=github-actions-oidc
+
+          kubectl config use-context prod
+
+#       # ─────────────────────────────────────────────
+#       # 9. Configure kubectl (FIXED AUTH)
+#       # ─────────────────────────────────────────────
+#       - name: Configure kubectl
+#         run: |
+#           echo "${{ secrets.K8S_CA_CERT }}" | base64 -d > ca.crt
+ 
+#           kubectl config set-cluster k8s \
+#             --server=${{ secrets.CLUSTER_URL }} \
+#             --certificate-authority=ca.crt
+ 
+#           kubectl config set-credentials github \
+#             --token=${TOKEN}
+ 
+#           kubectl config set-context prod \
+#             --cluster=k8s \
+#             --user=github \
+#             --namespace=backend
+ 
+#           kubectl config use-context prod
+ 
+#           echo "Testing access..."
+#           kubectl auth can-i get pods -n backend || true
+#           kubectl auth can-i list secrets -n backend || true
+ 
+# ---------------
+
+      - name: Deploy new image to prod
+        run: |
+          TAG="${{ needs.generate-tag-and-build-image.outputs.tag }}"
+          IMAGE="yampss/hipstershop-shippingservice:${TAG}"
+          echo "Deploying image: ${IMAGE}"
+
+          # Container name in the Deployment spec is 'server' (see templates/deployment.yaml).
+          kubectl set image deployment/shippingservice \
+            server="${IMAGE}" \
+            -n hipster-backend
+
+      - name: Wait for rollout to complete
+        run: |
+          kubectl rollout status deployment/shippingservice \
+            -n hipster-backend \
+            --timeout=5m
+
+      - name: Show final pod state
+        if: always()
+        run: |
+          kubectl get pods \
+            -n hipster-backend \
+            -l app=shippingservice \
+            -o wide
 
   notify:
-    needs: [sonar-and-snyk, generate-tag-and-build-image, push, update-helm-values-dev, update-helm-values-prod]
+    needs: [sonar-and-snyk, generate-tag-and-build-image, push, update-helm-values-dev, deploy-to-prod]
     if: always()
     uses: HipsterShopp/hipstershop-shared-workflows/.github/workflows/notify.yaml@feature/loose-coupling
     with:
