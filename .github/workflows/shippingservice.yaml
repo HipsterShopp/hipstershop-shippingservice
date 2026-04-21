@@ -21,7 +21,7 @@ on:
 
 permissions:
   contents: write
-  id-token: write   # required to request GitHub OIDC token for cluster authentication
+  id-token: write   
 
 
 jobs:
@@ -110,21 +110,7 @@ jobs:
         run: echo "Production deployment approved for tag ${{ needs.generate-tag-and-build-image.outputs.tag }}"
 
 
-  # ── GitHub Native CD — deploy directly to prod cluster via OIDC ──────────────
-  # No ArgoCD involved. No static kubeconfig. No long-lived token.
-  #
-  # Auth flow:
-  #   1. Runner requests a short-lived JWT from GitHub's OIDC provider
-  #        sub = repo:HipsterShopp/hipstershop-shippingservice:ref:refs/heads/main
-  #   2. kube-apiserver validates the JWT and resolves username as:
-  #        github:repo:HipsterShopp/hipstershop-shippingservice:ref:refs/heads/main
-  #   3. RoleBinding in hipster-backend grants this identity deploy permissions
-  #
-  # Runner is inside the same VPC — reaches API server via 127.0.0.1:6443.
-  # CA cert is read directly from the node filesystem — zero secrets needed.
-  #
-  # Prerequisites (one-time):
-  #   kubectl apply -f hipstershop-infra/rbac/github-actions-oidc-shippingservice.yaml
+
   deploy-to-prod:
     name: Deploy shippingservice to prod cluster
     needs: [prod-approval-gate, generate-tag-and-build-image]
@@ -172,32 +158,7 @@ jobs:
 
           kubectl config use-context prod
 
-#       # ─────────────────────────────────────────────
-#       # 9. Configure kubectl (FIXED AUTH)
-#       # ─────────────────────────────────────────────
-#       - name: Configure kubectl
-#         run: |
-#           echo "${{ secrets.K8S_CA_CERT }}" | base64 -d > ca.crt
- 
-#           kubectl config set-cluster k8s \
-#             --server=${{ secrets.CLUSTER_URL }} \
-#             --certificate-authority=ca.crt
- 
-#           kubectl config set-credentials github \
-#             --token=${TOKEN}
- 
-#           kubectl config set-context prod \
-#             --cluster=k8s \
-#             --user=github \
-#             --namespace=backend
- 
-#           kubectl config use-context prod
- 
-#           echo "Testing access..."
-#           kubectl auth can-i get pods -n backend || true
-#           kubectl auth can-i list secrets -n backend || true
- 
-# ---------------
+
 
       - name: Deploy new image to prod
         run: |
